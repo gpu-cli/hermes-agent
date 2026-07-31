@@ -967,9 +967,14 @@ class HermesACPAgent(acp.Agent):
                     persist_user_message=user_text or "[Image attachment]",
                 )
                 return result
-            except Exception as e:
+            except Exception:
                 logger.exception("Agent error in session %s", session_id)
-                return {"final_response": f"Error: {e}", "messages": state.history}
+                return {
+                    "final_response": None,
+                    "messages": state.history,
+                    "completed": False,
+                    "failed": True,
+                }
             finally:
                 # Restore HERMES_INTERACTIVE.
                 if previous_interactive is None:
@@ -997,10 +1002,12 @@ class HermesACPAgent(acp.Agent):
             result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
         except Exception:
             logger.exception("Executor error for session %s", session_id)
-            with state.runtime_lock:
-                state.is_running = False
-                state.current_prompt_text = ""
-            return PromptResponse(stop_reason="end_turn")
+            result = {
+                "final_response": None,
+                "messages": state.history,
+                "completed": False,
+                "failed": True,
+            }
 
         if result.get("messages"):
             state.history = result["messages"]
@@ -1008,7 +1015,16 @@ class HermesACPAgent(acp.Agent):
             self.session_manager.save_session(session_id)
 
         final_response = result.get("final_response", "")
-        if final_response:
+        has_final_response = (
+            isinstance(final_response, str) and bool(final_response.strip())
+        )
+        cancelled = bool(state.cancel_event and state.cancel_event.is_set())
+        refused = (
+            result.get("failed") is True
+            or result.get("completed") is False
+            or (not streamed_message and not has_final_response)
+        )
+        if has_final_response and not refused:
             try:
                 from agent.title_generator import maybe_auto_title
 
@@ -1021,7 +1037,7 @@ class HermesACPAgent(acp.Agent):
                 )
             except Exception:
                 logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
-        if final_response and conn and not streamed_message:
+        if has_final_response and not refused and conn and not streamed_message:
             update = acp.update_agent_message_text(final_response)
             await conn.session_update(session_id, update)
 
@@ -1059,7 +1075,12 @@ class HermesACPAgent(acp.Agent):
 
         await self._send_usage_update(state)
 
-        stop_reason = "cancelled" if state.cancel_event and state.cancel_event.is_set() else "end_turn"
+        if cancelled:
+            stop_reason = "cancelled"
+        elif refused:
+            stop_reason = "refusal"
+        else:
+            stop_reason = "end_turn"
         return PromptResponse(stop_reason=stop_reason, usage=usage)
 
     # ---- Slash commands (headless) -------------------------------------------

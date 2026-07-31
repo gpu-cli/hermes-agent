@@ -632,6 +632,205 @@ class TestPrompt:
         assert state.agent.thinking_callback is None
 
     @pytest.mark.asyncio
+    async def test_prompt_returns_refusal_for_failed_agent_result_without_leaking_error(
+        self, agent
+    ):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        sensitive_error = "provider rejected secret-bearing request"
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": None,
+            "messages": [],
+            "completed": False,
+            "failed": True,
+            "error": sensitive_error,
+        })
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="do the task")],
+            session_id=new_resp.session_id,
+        )
+
+        assert resp.stop_reason == "refusal"
+        assert sensitive_error not in repr(mock_conn.session_update.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_prompt_refuses_failed_result_with_nonblank_response(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        sensitive_response = "failed response containing secret detail"
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": sensitive_response,
+            "messages": [],
+            "completed": True,
+            "failed": True,
+        })
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="do the task")],
+            session_id=new_resp.session_id,
+        )
+
+        assert resp.stop_reason == "refusal"
+        assert sensitive_response not in repr(mock_conn.session_update.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_prompt_refuses_incomplete_result_with_nonblank_response(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        sensitive_response = "incomplete response containing secret detail"
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": sensitive_response,
+            "messages": [],
+            "completed": False,
+            "failed": False,
+        })
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="do the task")],
+            session_id=new_resp.session_id,
+        )
+
+        assert resp.stop_reason == "refusal"
+        assert sensitive_response not in repr(mock_conn.session_update.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_prompt_returns_refusal_for_empty_completed_result(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "",
+            "messages": [],
+            "completed": True,
+            "failed": False,
+        })
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="do the task")],
+            session_id=new_resp.session_id,
+        )
+
+        assert resp.stop_reason == "refusal"
+
+    @pytest.mark.asyncio
+    async def test_prompt_returns_refusal_for_executor_exception_without_leaking_error(
+        self, agent
+    ):
+        new_resp = await agent.new_session(cwd=".")
+        sensitive_error = "executor secret detail"
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        with patch("asyncio.get_running_loop") as mock_loop:
+            mock_loop.return_value.run_in_executor = AsyncMock(
+                side_effect=RuntimeError(sensitive_error)
+            )
+            resp = await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="do the task")],
+                session_id=new_resp.session_id,
+            )
+
+        assert resp.stop_reason == "refusal"
+        assert sensitive_error not in repr(mock_conn.session_update.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_prompt_returns_refusal_for_agent_exception_without_leaking_error(
+        self, agent
+    ):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        sensitive_error = "agent exception secret detail"
+        state.agent.run_conversation = MagicMock(
+            side_effect=RuntimeError(sensitive_error)
+        )
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="do the task")],
+            session_id=new_resp.session_id,
+        )
+
+        assert resp.stop_reason == "refusal"
+        assert state.is_running is False
+        assert sensitive_error not in repr(mock_conn.session_update.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_prompt_executor_exception_preserves_cancellation(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        sensitive_error = "cancelled executor secret detail"
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        async def cancel_then_raise(*args, **kwargs):
+            state.cancel_event.set()
+            raise RuntimeError(sensitive_error)
+
+        with patch("asyncio.get_running_loop") as mock_loop:
+            mock_loop.return_value.run_in_executor = AsyncMock(
+                side_effect=cancel_then_raise
+            )
+            resp = await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="do the task")],
+                session_id=new_resp.session_id,
+            )
+
+        assert resp.stop_reason == "cancelled"
+        assert state.is_running is False
+        assert sensitive_error not in repr(mock_conn.session_update.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_prompt_executor_exception_drains_queued_turns(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.queued_prompts.append("queued follow-up")
+        sensitive_error = "queued executor secret detail"
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        with patch("asyncio.get_running_loop") as mock_loop:
+            run_in_executor = AsyncMock(
+                side_effect=[
+                    RuntimeError(sensitive_error),
+                    {
+                        "final_response": "queued turn completed",
+                        "messages": [],
+                        "completed": True,
+                        "failed": False,
+                    },
+                ]
+            )
+            mock_loop.return_value.run_in_executor = run_in_executor
+            resp = await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="do the task")],
+                session_id=new_resp.session_id,
+            )
+
+        assert resp.stop_reason == "refusal"
+        assert state.queued_prompts == []
+        assert state.is_running is False
+        assert state.current_prompt_text == ""
+        assert run_in_executor.await_count == 2
+        assert sensitive_error not in repr(mock_conn.session_update.call_args_list)
+
+    @pytest.mark.asyncio
     async def test_prompt_updates_history(self, agent):
         """After a prompt, session history should be updated."""
         new_resp = await agent.new_session(cwd=".")
@@ -654,6 +853,32 @@ class TestPrompt:
         await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
 
         assert state.history == expected_history
+
+    @pytest.mark.asyncio
+    async def test_prompt_streamed_only_success_returns_end_turn(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("streamed success")
+            return {
+                "final_response": "",
+                "messages": [],
+                "completed": True,
+                "failed": False,
+            }
+
+        state.agent.run_conversation = mock_run
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="do the task")],
+            session_id=new_resp.session_id,
+        )
+
+        assert resp.stop_reason == "end_turn"
 
     @pytest.mark.asyncio
     async def test_prompt_sends_final_message_update(self, agent):

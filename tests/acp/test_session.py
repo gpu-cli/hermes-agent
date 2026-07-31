@@ -275,6 +275,41 @@ class TestPersistence:
 
         assert captured["enabled_toolsets"] == ["hermes-acp", "mcp-olympus", "mcp-exa"]
 
+    def test_create_session_forwards_resolved_credential_pool(self, tmp_path, monkeypatch):
+        """ACP agents must retain provider-pool rotation and refresh behavior."""
+        captured = {}
+        credential_pool = object()
+
+        def fake_resolve_runtime_provider(requested=None, **kwargs):
+            return {
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "base_url": "https://codex.example/v1",
+                "api_key": "stale-primary",
+                "credential_pool": credential_pool,
+                "command": None,
+                "args": [],
+            }
+
+        def fake_agent(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(model=kwargs.get("model"))
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
+            "model": {"provider": "openai-codex", "default": "gpt-test"}
+        })
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        db = SessionDB(tmp_path / "state.db")
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            manager = SessionManager(db=db)
+            manager.create_session(cwd="/work")
+
+        assert captured["credential_pool"] is credential_pool
+
     def test_create_session_writes_to_db(self, manager):
         state = manager.create_session(cwd="/project")
         db = manager._get_db()
