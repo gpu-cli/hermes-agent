@@ -110,6 +110,45 @@ class TestCreateSession:
 
         assert state.agent.session_cwd == "/tmp/project"
 
+    def test_make_agent_forwards_exact_resolved_credential_pool(self, monkeypatch):
+        pool = object()
+        captured = {}
+
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {
+                    "default": "fake-model",
+                    "provider": "openai-codex",
+                },
+                "mcp_servers": {},
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "codex_app_server",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+                "credential_pool": pool,
+            },
+        )
+        monkeypatch.setattr(
+            "acp_adapter.session._register_task_cwd", lambda task_id, cwd: None
+        )
+
+        SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert captured["credential_pool"] is pool
+
 
 
 

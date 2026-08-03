@@ -1551,11 +1551,7 @@ class HermesACPAgent(acp.Agent):
                     if getattr(state, "agent", None):
                         request_hard_interrupt(state.agent)
                 except Exception:
-                    logger.debug(
-                        "Failed to interrupt ACP session %s",
-                        session_id,
-                        exc_info=True,
-                    )
+                    logger.error("ACP hard interrupt failed")
             logger.info("Cancelled session %s", session_id)
 
     async def fork_session(
@@ -1767,6 +1763,18 @@ class HermesACPAgent(acp.Agent):
                 await self._conn.session_update(session_id, update)
             return PromptResponse(stop_reason="end_turn")
 
+        def _clear_active_prompt_state() -> None:
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
+
+        def _finish_cancelled_worker(future: asyncio.Future) -> None:
+            try:
+                future.exception()
+            except BaseException:
+                pass
+            _clear_active_prompt_state()
+
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
 
         conn = self._conn
@@ -1912,9 +1920,14 @@ class HermesACPAgent(acp.Agent):
                     persist_user_message=user_text or "[Image attachment]",
                 )
                 return result
-            except Exception as e:
-                logger.exception("Agent error in session %s", session_id)
-                return {"final_response": f"Error: {e}", "messages": state.history}
+            except Exception:
+                logger.error("ACP agent execution failed")
+                return {
+                    "final_response": None,
+                    "messages": state.history,
+                    "completed": False,
+                    "failed": True,
+                }
             finally:
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
@@ -1943,6 +1956,7 @@ class HermesACPAgent(acp.Agent):
                     except Exception:
                         logger.debug("Could not clear ACP session context", exc_info=True)
 
+        executor_future: asyncio.Future | None = None
         try:
             # Snapshot the internal Hermes DB session id before the turn so we
             # can detect a compression-driven session rotation afterwards. The
@@ -1954,18 +1968,47 @@ class HermesACPAgent(acp.Agent):
             # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
             # particular — used by the interactive sudo password cache scope).
             ctx = contextvars.copy_context()
-            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+            executor_future = loop.run_in_executor(_executor, ctx.run, _run_agent)
+            result = await asyncio.shield(executor_future)
+        except asyncio.CancelledError:
+            await self.cancel(session_id)
+            worker_finished = executor_future is None or executor_future.done()
+            if not worker_finished:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(executor_future), timeout=30
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    executor_future.add_done_callback(_finish_cancelled_worker)
+                    raise
+                except Exception:
+                    worker_finished = True
+                else:
+                    worker_finished = True
+            if worker_finished or executor_future is None or executor_future.done():
+                _clear_active_prompt_state()
+            else:
+                executor_future.add_done_callback(_finish_cancelled_worker)
+            raise
         except Exception:
-            logger.exception("Executor error for session %s", session_id)
-            with state.runtime_lock:
-                state.is_running = False
-                state.current_prompt_text = ""
-            return PromptResponse(stop_reason="end_turn")
+            logger.error("ACP executor failed")
+            result = {
+                "final_response": None,
+                "messages": state.history,
+                "completed": False,
+                "failed": True,
+            }
 
         if result.get("messages"):
             state.history = result["messages"]
             # Persist updated history so sessions survive process restarts.
-            self.session_manager.save_session(session_id)
+            try:
+                self.session_manager.save_session(session_id)
+            except BaseException:
+                _clear_active_prompt_state()
+                raise
 
         # Detect a compression-driven internal session rotation. If the agent's
         # DB head moved during the turn, emit a session_info_update carrying
@@ -1984,6 +2027,9 @@ class HermesACPAgent(acp.Agent):
                     current_hermes_session_id=post_turn_hermes_id,
                     previous_hermes_session_id=pre_turn_hermes_id,
                 )
+            except asyncio.CancelledError:
+                _clear_active_prompt_state()
+                raise
             except Exception:
                 logger.debug(
                     "Could not emit ACP provenance update after rotation for %s",
@@ -1992,16 +2038,26 @@ class HermesACPAgent(acp.Agent):
                 )
 
         final_response = result.get("final_response", "")
+        has_final_response = (
+            isinstance(final_response, str) and bool(final_response.strip())
+        )
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled
+        refused = (
+            result.get("failed") is True
+            or result.get("completed") is False
+            or (not streamed_message and not has_final_response)
+        )
         # Hermes' local "waiting for model response" interrupt status is metadata,
         # not assistant prose — clients get cancellation from stop_reason instead.
         from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 
-        suppress_interrupt_response = interrupted and final_response.startswith(
-            INTERRUPT_WAITING_FOR_MODEL_PREFIX
+        suppress_interrupt_response = (
+            interrupted
+            and has_final_response
+            and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
         )
-        if final_response and not suppress_interrupt_response:
+        if has_final_response and not refused and not suppress_interrupt_response:
             try:
                 from agent.title_generator import maybe_auto_title
 
@@ -2039,7 +2095,8 @@ class HermesACPAgent(acp.Agent):
             except Exception:
                 logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
         if (
-            final_response
+            has_final_response
+            and not refused
             and conn
             and not suppress_interrupt_response
             and (not streamed_message or result.get("response_transformed"))
@@ -2049,14 +2106,16 @@ class HermesACPAgent(acp.Agent):
             # finished (e.g. transform_llm_output) — otherwise the appended /
             # rewritten text never reaches the client.
             update = acp.update_agent_message_text(final_response)
-            await conn.session_update(session_id, update)
+            try:
+                await conn.session_update(session_id, update)
+            except BaseException:
+                _clear_active_prompt_state()
+                raise
 
         # Mark this turn idle before draining queued work so recursive prompt()
         # calls can acquire the session. Queued turns are intentionally run as
         # normal follow-up user prompts, preserving role alternation and history.
-        with state.runtime_lock:
-            state.is_running = False
-            state.current_prompt_text = ""
+        _clear_active_prompt_state()
 
         while True:
             with state.runtime_lock:
@@ -2085,7 +2144,12 @@ class HermesACPAgent(acp.Agent):
 
         await self._send_usage_update(state)
 
-        stop_reason = "cancelled" if cancelled else "end_turn"
+        if cancelled:
+            stop_reason = "cancelled"
+        elif refused:
+            stop_reason = "refusal"
+        else:
+            stop_reason = "end_turn"
         return PromptResponse(stop_reason=stop_reason, usage=usage)
 
     # ---- Slash commands (headless) -------------------------------------------
