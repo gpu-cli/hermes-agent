@@ -120,3 +120,16 @@ def test_openai_codex_stale_floor_tiers():
 
     assert openai_codex_stale_timeout_floor(55_000) == 900.0
     assert openai_codex_stale_timeout_floor(120_000) == 1200.0
+
+
+def test_openai_codex_stale_floor_preserves_explicit_provider_bound(monkeypatch):
+    from agent import chat_completion_helpers as helpers
+
+    agent = type("Agent", (), {"provider": "openai-codex", "model": "gpt-5.6-terra"})()
+    monkeypatch.setattr(helpers, "get_provider_stale_timeout", lambda *_args: 180.0)
+
+    assert helpers.apply_openai_codex_stale_timeout_floor(
+        agent,
+        stale_timeout=180.0,
+        estimated_context_tokens=55_000,
+    ) == 180.0

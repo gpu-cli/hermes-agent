@@ -159,6 +159,21 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     return 0.0
 
 
+def apply_openai_codex_stale_timeout_floor(
+    agent,
+    *,
+    stale_timeout: float,
+    estimated_context_tokens: int,
+) -> float:
+    """Apply the implicit Codex floor without overriding explicit config."""
+    if get_provider_stale_timeout(agent.provider, agent.model) is not None:
+        return stale_timeout
+    return max(
+        stale_timeout,
+        openai_codex_stale_timeout_floor(estimated_context_tokens),
+    )
+
+
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     """Return a normalized OpenRouter provider.sort value or None."""
     if not isinstance(raw_sort, str):
@@ -797,9 +812,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _openai_codex_backend = _is_openai_codex_backend(agent)
     _est_tokens_for_codex_watchdog = estimate_request_context_tokens(api_kwargs)
     if _codex_watchdog_enabled and _openai_codex_backend:
-        _codex_floor = openai_codex_stale_timeout_floor(_est_tokens_for_codex_watchdog)
-        if _codex_floor:
-            _stale_timeout = max(_stale_timeout, _codex_floor)
+        _stale_timeout = apply_openai_codex_stale_timeout_floor(
+            agent,
+            stale_timeout=_stale_timeout,
+            estimated_context_tokens=_est_tokens_for_codex_watchdog,
+        )
 
     # ── Codex absolute hard ceiling (#64507) ──────────────────────────
     # ``openai_codex_stale_timeout_floor`` *raises* the stale timeout (up to

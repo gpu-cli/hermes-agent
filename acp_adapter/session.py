@@ -620,6 +620,20 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
 
+        agent_cfg = config.get("agent")
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+
+        max_iterations = agent_cfg.get("max_turns")
+        if (
+            not isinstance(max_iterations, int)
+            or isinstance(max_iterations, bool)
+            or max_iterations <= 0
+        ):
+            max_iterations = 90
+
+        from hermes_constants import resolve_reasoning_config
+
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
@@ -630,6 +644,11 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            "max_iterations": max_iterations,
+            "reasoning_config": resolve_reasoning_config(
+                config,
+                model or default_model,
+            ),
         }
 
         try:
